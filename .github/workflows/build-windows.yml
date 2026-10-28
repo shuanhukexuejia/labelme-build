@@ -25,7 +25,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
-          python -m pip install "labelme==6.3.1" "onnxruntime==1.23.2" pyinstaller
+          python -m pip install "labelme==6.3.1" "onnxruntime==1.23.2" "numpy==1.26.4" pyinstaller
           if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
           python -m pip check
           if ($LASTEXITCODE -ne 0) { throw "Dependency check failed" }
@@ -40,15 +40,33 @@ jobs:
           if __name__ == "__main__":
               freeze_support()
               import sys
-              from labelme.__main__ import main
 
               if len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
+                  import faulthandler
+                  import traceback
                   from pathlib import Path
-                  from PyQt5.QtWidgets import QApplication
 
-                  app = QApplication([])
-                  Path(sys.argv[2]).write_text("ok", encoding="utf-8")
+                  marker = Path(sys.argv[2])
+                  with marker.with_suffix(".log").open("w", encoding="utf-8", buffering=1) as log:
+                      faulthandler.enable(file=log)
+                      try:
+                          print("Importing Labelme and ONNX Runtime...", file=log)
+                          from labelme.__main__ import main
+                          print("Initializing Qt...", file=log)
+                          from PyQt5.QtWidgets import QApplication
+                          app = QApplication([])
+                          app.processEvents()
+                          app.quit()
+                          del app
+                          print("Qt initialized and closed successfully.", file=log)
+                          marker.write_text("ok", encoding="utf-8")
+                      except BaseException:
+                          traceback.print_exc(file=log)
+                          sys.exit(1)
+                      finally:
+                          faulthandler.disable()
               else:
+                  from labelme.__main__ import main
                   main()
           '@
 
@@ -60,18 +78,36 @@ jobs:
       - name: Check packaged DLL imports and Qt startup
         run: |
           $marker = Join-Path $env:RUNNER_TEMP "labelme-smoke-test.txt"
+          $log = [System.IO.Path]::ChangeExtension($marker, '.log')
           Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $log -Force -ErrorAction SilentlyContinue
           $app = Start-Process -FilePath "$PWD\dist\Labelme\Labelme.exe" -ArgumentList @('--smoke-test', ('"' + $marker + '"')) -PassThru
-          if (-not $app.WaitForExit(60000)) {
+          $timedOut = -not $app.WaitForExit(120000)
+          if ($timedOut) {
             Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
-            throw "Packaged application startup timed out"
           }
+          if (Test-Path -LiteralPath $log) {
+            Get-Content -LiteralPath $log
+            Copy-Item -LiteralPath $log -Destination "$PWD\startup-check.log"
+          } else {
+            'The application did not reach the Python launcher.' | Set-Content "$PWD\startup-check.log"
+          }
+          if ($timedOut) { throw "Packaged application startup timed out; see the startup log above" }
+          $app.Refresh()
           if ($app.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $marker)) {
-            throw "Packaged application could not load its DLLs or initialize Qt"
+            throw "Packaged application failed startup; see the startup log above"
           }
           if ((Get-Content -LiteralPath $marker -Raw) -ne 'ok') {
             throw "Unexpected startup check result"
           }
+
+      - name: Upload startup diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Labelme-Startup-Diagnostics
+          path: startup-check.log
+          if-no-files-found: warn
 
       - name: Download Microsoft runtime
         run: |
