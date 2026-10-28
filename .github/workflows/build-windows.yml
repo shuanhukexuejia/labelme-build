@@ -1,4 +1,4 @@
-name: Build Labelme Windows
+name: Build Labelme Windows Installer
 
 on:
   workflow_dispatch:
@@ -9,38 +9,141 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          architecture: "x64"
 
-      - name: Install dependencies
+      - name: Install dependencies and check imports
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "labelme==6.3.1" "onnxruntime<1.24" pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          python -m pip install "labelme==6.3.1" "onnxruntime==1.23.2" pyinstaller
+          if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed" }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "Dependency check failed" }
+          python -c "import labelme, onnxruntime; assert labelme.__version__ == '6.3.1'; print('ONNX Runtime:', onnxruntime.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Import check failed" }
 
       - name: Create launcher
-        shell: pwsh
         run: |
           Set-Content -Path launcher.py -Encoding UTF8 -Value @'
-          from labelme.__main__ import main
+          from multiprocessing import freeze_support
 
           if __name__ == "__main__":
-              main()
+              freeze_support()
+              import sys
+              from labelme.__main__ import main
+
+              if len(sys.argv) == 3 and sys.argv[1] == "--smoke-test":
+                  from pathlib import Path
+                  from PyQt5.QtWidgets import QApplication
+
+                  app = QApplication([])
+                  Path(sys.argv[2]).write_text("ok", encoding="utf-8")
+              else:
+                  main()
           '@
 
-      - name: Build EXE
+      - name: Build application
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name Labelme --collect-all labelme --collect-all osam --collect-all imgviz launcher.py
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name Labelme --collect-all labelme --collect-all osam --collect-all imgviz launcher.py
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
-      - name: Upload EXE
+      - name: Check packaged DLL imports and Qt startup
+        run: |
+          $marker = Join-Path $env:RUNNER_TEMP "labelme-smoke-test.txt"
+          Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+          $app = Start-Process -FilePath "$PWD\dist\Labelme\Labelme.exe" -ArgumentList @('--smoke-test', ('"' + $marker + '"')) -PassThru
+          if (-not $app.WaitForExit(60000)) {
+            Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+            throw "Packaged application startup timed out"
+          }
+          if ($app.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $marker)) {
+            throw "Packaged application could not load its DLLs or initialize Qt"
+          }
+          if ((Get-Content -LiteralPath $marker -Raw) -ne 'ok') {
+            throw "Unexpected startup check result"
+          }
+
+      - name: Download Microsoft runtime
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile vc_redist.x64.exe
+          $signature = Get-AuthenticodeSignature -FilePath vc_redist.x64.exe
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation,') {
+            throw "Microsoft runtime signature verification failed"
+          }
+
+      - name: Create installer
+        run: |
+          Set-Content -Path installer.iss -Encoding UTF8 -Value @'
+          [Setup]
+          AppId=Labelme.Community.6
+          AppName=Labelme
+          AppVersion=6.3.1
+          DefaultDirName={autopf}\Labelme
+          DefaultGroupName=Labelme
+          DisableProgramGroupPage=yes
+          OutputDir=installer-output
+          OutputBaseFilename=Labelme-6.3.1-Windows-Setup
+          Compression=lzma2
+          SolidCompression=yes
+          PrivilegesRequired=admin
+          ArchitecturesAllowed=x64compatible
+          ArchitecturesInstallIn64BitMode=x64compatible
+          MinVersion=10.0
+          UninstallDisplayIcon={app}\Labelme.exe
+
+          [Files]
+          Source: "dist\Labelme\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+          Source: "vc_redist.x64.exe"; Flags: dontcopy
+
+          [Icons]
+          Name: "{group}\Labelme"; Filename: "{app}\Labelme.exe"
+          Name: "{autodesktop}\Labelme"; Filename: "{app}\Labelme.exe"
+
+          [Code]
+          var
+            RuntimeNeedsRestart: Boolean;
+
+          function PrepareToInstall(var NeedsRestart: Boolean): String;
+          var
+            ExitCode: Integer;
+          begin
+            Result := '';
+            ExtractTemporaryFile('vc_redist.x64.exe');
+            if not Exec(ExpandConstant('{tmp}\vc_redist.x64.exe'),
+              '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
+            begin
+              Result := 'Microsoft runtime could not start. Setup cannot continue.';
+              Exit;
+            end;
+            if ExitCode = 3010 then
+              RuntimeNeedsRestart := True
+            else if (ExitCode <> 0) and (ExitCode <> 1638) and (ExitCode <> -2147023258) then
+              Result := 'Microsoft runtime installation failed (code ' + IntToStr(ExitCode) + '). Setup cannot continue.';
+          end;
+
+          function NeedRestart(): Boolean;
+          begin
+            Result := RuntimeNeedsRestart;
+          end;
+          '@
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $compiler)) { throw "Inno Setup compiler is not installed on this runner" }
+          & $compiler installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed" }
+
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: Labelme-Windows
-          path: dist/Labelme.exe
+          name: Labelme-Windows-Installer
+          path: installer-output/Labelme-6.3.1-Windows-Setup.exe
           if-no-files-found: error
