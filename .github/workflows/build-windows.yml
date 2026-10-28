@@ -75,6 +75,45 @@ jobs:
           python -m PyInstaller --noconfirm --clean --onedir --windowed --name Labelme --collect-all labelme --collect-all osam --collect-all imgviz launcher.py
           if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
+      - name: Download and install Microsoft runtime
+        run: |
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile vc_redist.x64.exe
+          $signature = Get-AuthenticodeSignature -FilePath vc_redist.x64.exe
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation,') {
+            throw "Microsoft runtime signature verification failed"
+          }
+          $runtime = Start-Process -FilePath "$PWD\vc_redist.x64.exe" -ArgumentList '/install /quiet /norestart' -Wait -PassThru
+          if ($runtime.ExitCode -notin @(0, 1638, 3010, -2147023258)) {
+            throw "Microsoft runtime installation failed: $($runtime.ExitCode)"
+          }
+
+      - name: Remove conflicting bundled Microsoft runtime DLLs
+        run: |
+          Get-Item "$env:SystemRoot\System32\msvcp140.dll" | Select-Object FullName, @{Name='Version';Expression={$_.VersionInfo.FileVersion}} | Format-List
+          Get-ChildItem -Path dist\Labelme -Filter msvcp140.dll -Recurse | Select-Object FullName, @{Name='Version';Expression={$_.VersionInfo.FileVersion}} | Format-List
+          Set-Content -Path clean_runtime.py -Encoding UTF8 -Value @'
+          from pathlib import Path
+
+          root = Path("dist/Labelme")
+          if not root.is_dir():
+              raise FileNotFoundError(root)
+
+          # Qt wheels can ship older VC++ DLLs that override the installed runtime.
+          runtime_names = {
+              "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+              "msvcp140_atomic_wait.dll", "msvcp140_codecvt_ids.dll",
+              "vcruntime140.dll", "vcruntime140_1.dll", "vcruntime140_threads.dll",
+              "concrt140.dll", "vccorlib140.dll",
+          }
+          for path in root.rglob("*"):
+              if path.is_file() and path.name.lower() in runtime_names:
+                  print("Using the installed Microsoft runtime instead of:", path)
+                  path.unlink()
+          assert not any(p.is_file() and p.name.lower() in runtime_names for p in root.rglob("*"))
+          '@
+          python clean_runtime.py
+          if ($LASTEXITCODE -ne 0) { throw "Runtime DLL cleanup failed" }
+
       - name: Check packaged DLL imports and Qt startup
         run: |
           $marker = Join-Path $env:RUNNER_TEMP "labelme-smoke-test.txt"
@@ -108,14 +147,6 @@ jobs:
           name: Labelme-Startup-Diagnostics
           path: startup-check.log
           if-no-files-found: warn
-
-      - name: Download Microsoft runtime
-        run: |
-          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile vc_redist.x64.exe
-          $signature = Get-AuthenticodeSignature -FilePath vc_redist.x64.exe
-          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation,') {
-            throw "Microsoft runtime signature verification failed"
-          }
 
       - name: Create installer
         run: |
